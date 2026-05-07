@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class PostgreSQLStockDB:
-    """PostgreSQL 股票数据库管理类（带连接池）"""
+    """股票数据库管理类（支持 PostgreSQL 和 SQLite）"""
 
     def __init__(self, connection_string=None, pool_size=5,
                  max_overflow=10, pool_recycle=3600):
@@ -22,16 +22,17 @@ class PostgreSQLStockDB:
             connection_string = get_database_url()
 
         self.connection_string = connection_string
+        self.is_sqlite = 'sqlite' in connection_string.lower()
         self.engine = create_engine(
             connection_string,
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_recycle=pool_recycle,
-            pool_pre_ping=True,   # 自动检测断开的连接
+            pool_size=pool_size if not self.is_sqlite else 0,
+            max_overflow=max_overflow if not self.is_sqlite else 0,
+            pool_recycle=pool_recycle if not self.is_sqlite else -1,
+            pool_pre_ping=True,
             echo=False,
         )
-        logger.info("PostgreSQL 连接池已创建 (size=%s, overflow=%s)",
-                     pool_size, max_overflow)
+        db_type = "SQLite" if self.is_sqlite else "PostgreSQL"
+        logger.info("%s 连接已创建", db_type)
 
     @staticmethod
     def _records_with_none(df: pd.DataFrame):
@@ -48,6 +49,7 @@ class PostgreSQLStockDB:
     # ------------------------------------------------------------------
     def init_tables(self):
         """创建核心表结构"""
+        serial_pk = "INTEGER PRIMARY KEY AUTOINCREMENT" if self.is_sqlite else "SERIAL PRIMARY KEY"
         with self.engine.begin() as conn:
             # ---- stock_basic ----
             conn.execute(text('''
@@ -83,9 +85,9 @@ class PostgreSQLStockDB:
             '''))
 
             # ---- sync_log ----
-            conn.execute(text('''
+            conn.execute(text(f'''
                 CREATE TABLE IF NOT EXISTS sync_log (
-                    id              SERIAL PRIMARY KEY,
+                    id              {serial_pk},
                     task_type       VARCHAR(50),
                     stock_code      VARCHAR(20),
                     date_range_start DATE,
@@ -328,30 +330,25 @@ class PostgreSQLStockDB:
         available = [c for c in needed if c in df.columns]
         df = df[available]
 
-        sql = text('''
-            INSERT INTO stock_daily_hfq
-                (stock_code, trade_date, open, close, high, low,
-                 volume, amount, change_pct, change_amount,
-                 turnover_ratio, pre_close, update_time)
-            VALUES
-                (:stock_code, :trade_date, :open, :close, :high, :low,
-                 :volume, :amount, :change_pct, :change_amount,
-                 :turnover_ratio, :pre_close, :update_time)
-            ON CONFLICT (stock_code, trade_date) DO UPDATE SET
-                open            = EXCLUDED.open,
-                close           = EXCLUDED.close,
-                high            = EXCLUDED.high,
-                low             = EXCLUDED.low,
-                volume          = EXCLUDED.volume,
-                amount          = EXCLUDED.amount,
-                change_pct      = EXCLUDED.change_pct,
-                change_amount   = EXCLUDED.change_amount,
-                turnover_ratio  = EXCLUDED.turnover_ratio,
-                pre_close       = EXCLUDED.pre_close,
-                update_time     = EXCLUDED.update_time
-        ''')
-
+        # 动态构建 SQL，只包含实际存在的列
         rows = self._records_with_none(df)
+        # 确保所有行都有相同的键（缺失的设为 None）
+        for row in rows:
+            for col in available:
+                if col not in row:
+                    row[col] = None
+
+        cols = available
+        placeholders = ', '.join([f':{c}' for c in cols])
+        col_list = ', '.join(cols)
+        update_set = ', '.join([f"{c} = EXCLUDED.{c}" for c in cols if c not in ('stock_code', 'trade_date')])
+
+        sql = text(f'''
+            INSERT INTO stock_daily_hfq ({col_list})
+            VALUES ({placeholders})
+            ON CONFLICT (stock_code, trade_date) DO UPDATE SET
+                {update_set}
+        ''')
 
         with self.engine.begin() as conn:
             conn.execute(sql, rows)
@@ -640,12 +637,15 @@ class PostgreSQLStockDB:
             stats['total_concepts'] = conn.execute(
                 text("SELECT COUNT(*) FROM concept_board")).scalar() or 0
 
-            try:
-                stats['database_size'] = conn.execute(
-                    text("SELECT pg_size_pretty(pg_total_relation_size('stock_daily_hfq'))")
-                ).scalar()
-            except Exception:
-                stats['database_size'] = 'N/A'
+            if not self.is_sqlite:
+                try:
+                    stats['database_size'] = conn.execute(
+                        text("SELECT pg_size_pretty(pg_total_relation_size('stock_daily_hfq'))")
+                    ).scalar()
+                except Exception:
+                    stats['database_size'] = 'N/A'
+            else:
+                stats['database_size'] = 'N/A (SQLite)'
 
             row = conn.execute(text(
                 "SELECT MIN(trade_date), MAX(trade_date) FROM stock_daily_hfq"
@@ -1040,11 +1040,11 @@ class PostgreSQLStockDB:
     def optimize(self):
         """ANALYZE 更新查询统计"""
         with self.engine.begin() as conn:
-            conn.execute(text("ANALYZE stock_daily_hfq"))
-            conn.execute(text("ANALYZE stock_basic"))
-            conn.execute(text("ANALYZE stock_financial"))
-            conn.execute(text("ANALYZE index_daily"))
-            conn.execute(text("ANALYZE concept_board"))
-            conn.execute(text("ANALYZE concept_constituent"))
-            conn.execute(text("ANALYZE stock_realtime"))
+            for tbl in ['stock_daily_hfq', 'stock_basic', 'stock_financial',
+                        'index_daily', 'concept_board', 'concept_constituent',
+                        'stock_realtime']:
+                try:
+                    conn.execute(text(f"ANALYZE {tbl}"))
+                except Exception:
+                    pass
         logger.info("数据库 ANALYZE 完成")

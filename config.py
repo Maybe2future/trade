@@ -13,7 +13,7 @@ DB_TYPE = 'sqlite'
 
 # SQLite配置（备选，零配置，适合小型应用）
 SQLITE_CONFIG = {
-    'db_path': './data/stock_db.sqlite'
+    'db_path': '/home/lom/openclaw_file/trade/astock_system/data/stock_db.sqlite'
 }
 
 # PostgreSQL配置（主力数据库）
